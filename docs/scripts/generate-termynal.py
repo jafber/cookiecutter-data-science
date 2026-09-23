@@ -1,46 +1,48 @@
 import json
-import shutil
+import os
+import re
+import sys
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import pexpect
 from ansi2html import Ansi2HTMLConverter
+from pexpect.popen_spawn import PopenSpawn
 
 CCDS_ROOT = Path(__file__).parents[2].resolve()
 
 
-def execute_command_and_get_output(command, input_script):
-    input_script = iter(input_script)
-    child = pexpect.spawn(command, encoding="utf-8")
-
-    interaction_history = [f"$ {command}\n"]
-
-    prompt, user_input = next(input_script)
-
+def execute_command_and_get_output(command, input_script, cwd):
+    """Capture a dialogue using pipes, which are available on every platform."""
+    child = PopenSpawn(
+        command,
+        cwd=cwd,
+        env={**os.environ, "PYTHONIOENCODING": "utf-8"},
+        encoding="utf-8",
+        timeout=30,
+    )
+    transcript = []
     try:
-        while True:
-            index = child.expect([prompt, pexpect.EOF, pexpect.TIMEOUT])
-
-            if index == 0:
-                output = child.before + child.after
-                interaction_history += [line.strip() for line in output.splitlines()]
-
-                child.sendline(user_input)
-
-                try:
-                    prompt, user_input = next(input_script)
-                except StopIteration:
-                    pass
-
-            elif index == 1:  # The subprocess has exited.
-                output = child.before
-                interaction_history += [line.strip() for line in output.splitlines()]
-                break
-            elif index == 2:  # Timeout waiting for new data.
-                print("\nTimeout waiting for subprocess response.")
-                continue
-
+        for prompt, user_input in input_script:
+            # Wait for the complete prompt: pipes do not provide terminal echo.
+            child.expect(re.escape(prompt) + r"[^\r\n]*: ")
+            transcript.append(child.before + child.after + user_input + "\n")
+            child.sendline(user_input)
+        child.sendeof()
+        child.expect(pexpect.EOF)
+        transcript.append(child.before)
+        if child.wait() != 0:
+            raise RuntimeError("CCDS failed:\n" + "".join(transcript))
     finally:
-        return interaction_history
+        if child.proc.poll() is None:
+            child.proc.kill()
+        child.proc.wait()
+        child.proc.stdin.close()
+        child.proc.stdout.close()
+
+    return [f"$ ccds {CCDS_ROOT}"] + [
+        line.strip() for line in "".join(transcript).splitlines()
+    ]
 
 
 ccds_script = [
@@ -65,15 +67,13 @@ ccds_script = [
 
 
 def run_scripts():
-    try:
-        output = []
-        output += execute_command_and_get_output(f"ccds {CCDS_ROOT}", ccds_script)
-        return output
-
-    finally:
-        # always cleanup
-        if Path("my_analysis").exists():
-            shutil.rmtree("my_analysis")
+    # Never generate into (or delete a project from) the developer's directory.
+    with TemporaryDirectory(prefix="ccds-docs-") as directory:
+        return execute_command_and_get_output(
+            [sys.executable, "-u", "-m", "ccds", str(CCDS_ROOT)],
+            ccds_script,
+            directory,
+        )
 
 
 def render_termynal():
@@ -101,16 +101,14 @@ def render_termynal():
         # style inline cookiecutter user inputs
         elif ":" in result and user_input in result:
             # treat all the options that were output as a single block
-            if len(result_collector) > 1:
-                prev_results = conv.convert(
-                    "\n".join(result_collector[:-1]), full=False
-                )
+            if result_collector:
+                prev_results = conv.convert("\n".join(result_collector), full=False)
                 html_lines.append(f"<span data-ty>{prev_results}</span>")
 
             # split the line up into the prompt text with options, the default, and the user input
             prompt, user_input = result.strip().split(":", 1)
             prompt = conv.convert(prompt, full=False)
-            prompt = f'<span data-ty class="inline-input">{result_collector[-1].strip()} {prompt}:</span>'
+            prompt = f'<span data-ty class="inline-input">{prompt}:</span>'
             user_input = conv.convert(user_input.strip(), full=False)
 
             # treat the cookiecutter prompt as a shell prompt
@@ -129,6 +127,9 @@ def render_termynal():
         else:
             result_collector.append(result)
 
+    if result_collector:
+        remaining = conv.convert("\n".join(result_collector), full=False)
+        html_lines.append(f"<span data-ty>{remaining}</span>")
     html_lines.append("</div>")
     output = "\n".join(html_lines)
 
